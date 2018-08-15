@@ -45,9 +45,8 @@ import deap
 from deap import base, creator, tools, gp
 from copy import copy, deepcopy
 
-import dask
 from sklearn.base import BaseEstimator
-from sklearn.utils import check_X_y, check_consistent_length
+from sklearn.utils import check_X_y, check_consistent_length, check_array
 from sklearn.externals.joblib import Parallel, delayed, Memory
 from sklearn.pipeline import make_pipeline, make_union
 from sklearn.preprocessing import FunctionTransformer, Imputer
@@ -125,7 +124,8 @@ class TPOTBase(BaseEstimator):
                  random_state=None, config_dict=None,
                  warm_start=False, memory=None,
                  periodic_checkpoint_folder=None, early_stop=None,
-                 verbosity=0, disable_update_check=False):
+                 verbosity=0, disable_update_check=False,
+                 use_dask=False):
         """Set up the genetic programming algorithm for pipeline optimization.
 
         Parameters
@@ -287,6 +287,7 @@ class TPOTBase(BaseEstimator):
         self._last_optimized_pareto_front_n_gens = 0
         self.memory = memory
         self._memory = None # initial Memory setting for sklearn pipeline
+        self.use_dask = use_dask
 
         # dont save periodic pipelines more often than this
         self._output_best_pipeline_period_seconds = 30
@@ -801,10 +802,7 @@ class TPOTBase(BaseEstimator):
         if not self.fitted_pipeline_:
             raise RuntimeError('A pipeline has not yet been optimized. Please call fit() first.')
 
-        features = features.astype(np.float64)
-
-        if np.any(np.isnan(features)):
-            features = self._impute_values(features)
+        features = self._check_dataset(features, target=None, sample_weight=None)
 
         return self.fitted_pipeline_.predict(features)
 
@@ -831,6 +829,7 @@ class TPOTBase(BaseEstimator):
 
         """
         self.fit(features, target, sample_weight=sample_weight, groups=groups)
+
         return self.predict(features)
 
     def score(self, testing_features, testing_target):
@@ -852,8 +851,7 @@ class TPOTBase(BaseEstimator):
         if self.fitted_pipeline_ is None:
             raise RuntimeError('A pipeline has not yet been optimized. Please call fit() first.')
 
-        if np.any(np.isnan(testing_features)):
-            testing_features = self._impute_values(testing_features)
+        testing_features, testing_target = self._check_dataset(testing_features, testing_target, sample_weight=None)
 
         # If the scoring function is a string, we must adjust to use the sklearn
         # scoring interface
@@ -884,12 +882,10 @@ class TPOTBase(BaseEstimator):
             if not (hasattr(self.fitted_pipeline_, 'predict_proba')):
                 raise RuntimeError('The fitted pipeline does not have the predict_proba() function.')
 
-            features = features.astype(np.float64)
+            #features = features.astype(np.float64)
+            features = self._check_dataset(features, target=None, sample_weight=None)
 
-            if np.any(np.isnan(features)):
-                features = self._impute_values(features)
-
-            return self.fitted_pipeline_.predict_proba(features.astype(np.float64))
+            return self.fitted_pipeline_.predict_proba(features)
 
     def set_params(self, **params):
         """Set the parameters of TPOT.
@@ -1025,7 +1021,7 @@ class TPOTBase(BaseEstimator):
         ----------
         features: array-like {n_samples, n_features}
             Feature matrix
-        target: array-like {n_samples}
+        target: array-like {n_samples} or None
             List of class labels for prediction
         sample_weight: array-like {n_samples} (optional)
             List of weights indicating relative importance
@@ -1062,9 +1058,14 @@ class TPOTBase(BaseEstimator):
             if np.any(np.isnan(features)):
                 self._imputed = True
                 features = self._impute_values(features)
+
         try:
-            X, y = check_X_y(features, target, accept_sparse=True, dtype=np.float64)
-            return X, y
+            if target is not None:
+                X, y = check_X_y(features, target, accept_sparse=True, dtype=np.float64)
+                return X, y
+            else:
+                X = check_array(features, order="C",  accept_sparse=True, dtype=np.float64)
+                return X
         except (AssertionError, ValueError):
             raise ValueError(
                 'Error: Input data is not in a valid format. Please confirm '
@@ -1180,6 +1181,7 @@ class TPOTBase(BaseEstimator):
 
         """
 
+        self._individuals = individuals
         operator_counts, eval_individuals_str, sklearn_pipeline_list, stats_dicts = self._preprocess_individuals(individuals)
 
         # Make the partial function that will be called below
@@ -1192,6 +1194,7 @@ class TPOTBase(BaseEstimator):
             sample_weight=sample_weight,
             groups=groups,
             timeout=self.max_eval_time_seconds,
+            use_dask=self.use_dask,
         )
 
         result_score_list = []
@@ -1199,22 +1202,46 @@ class TPOTBase(BaseEstimator):
         if self.n_jobs == 1:
             for sklearn_pipeline in sklearn_pipeline_list:
                 self._stop_by_max_time_mins()
-                val = partial_wrapped_cross_val_score(sklearn_pipeline=sklearn_pipeline, delayed=lambda x: x)
+                val = partial_wrapped_cross_val_score(sklearn_pipeline=sklearn_pipeline, use_dask=self.use_dask)
                 result_score_list = self._update_val(val, result_score_list)
         else:
             # chunk size for pbar update
             # chunk size is min of cpu_count * 2 and n_jobs * 4
-            chunk_size = min(cpu_count()*2, self.n_jobs*4)
-            for chunk_idx in range(0, len(sklearn_pipeline_list), chunk_size):
-                self._stop_by_max_time_mins()
-                parallel = Parallel(n_jobs=self.n_jobs, verbose=0, pre_dispatch='2*n_jobs')
-                tmp_result_scores = [partial_wrapped_cross_val_score(sklearn_pipeline=sklearn_pipeline,
-                                                                     delayed=dask.delayed)
-                                             for sklearn_pipeline in sklearn_pipeline_list[chunk_idx:chunk_idx + chunk_size]]
-                result_score_list.extend(tmp_result_scores)
+            if self.use_dask:
+                import dask
 
-        result_score_list = dask.compute(*result_score_list)
-        self._update_pbar(len(result_score_list))
+                result_score_list = [
+                    partial_wrapped_cross_val_score(sklearn_pipeline=sklearn_pipeline)
+                    for sklearn_pipeline in sklearn_pipeline_list
+                ]
+
+                self.dask_graphs_ = result_score_list
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore')
+                    result_score_list = list(dask.compute(*result_score_list))
+
+                self._update_pbar(len(result_score_list))
+
+            else:
+                chunk_size = min(cpu_count()*2, self.n_jobs*4)
+
+                for chunk_idx in range(0, len(sklearn_pipeline_list), chunk_size):
+                    self._stop_by_max_time_mins()
+
+                    parallel = Parallel(n_jobs=self.n_jobs, verbose=0, pre_dispatch='2*n_jobs')
+                    tmp_result_scores = parallel(
+                        delayed(partial_wrapped_cross_val_score)(sklearn_pipeline=sklearn_pipeline)
+                        for sklearn_pipeline in sklearn_pipeline_list[chunk_idx:chunk_idx + chunk_size])
+                    # update pbar
+                    for val in tmp_result_scores:
+                        result_score_list = self._update_val(val, result_score_list)
+
+
+        self._result_score_list = result_score_list
+        self._eval_individuals_str = eval_individuals_str
+        self._operator_counts = operator_counts
+        self._stats_dicts = stats_dicts
+
         self._update_evaluated_individuals_(result_score_list, eval_individuals_str, operator_counts, stats_dicts)
 
         """Look up the operator count and cross validation score to use in the optimization"""
