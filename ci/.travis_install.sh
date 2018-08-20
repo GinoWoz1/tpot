@@ -54,7 +54,8 @@ pip install update_checker
 pip install tqdm
 pip install stopit
 pip install xgboost
-pip install dask[delayed] dask-ml
+conda install dask
+conda install -c conda-forge dask-ml
 
 if [[ "$COVERAGE" == "true" ]]; then
     pip install coverage coveralls
