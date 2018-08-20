@@ -253,6 +253,14 @@ class TPOTBase(BaseEstimator):
             A setting of 2 or higher will add a progress bar during the optimization procedure.
         disable_update_check: bool, optional (default: False)
             Flag indicating whether the TPOT version checker should be disabled.
+        use_dask : bool, default False
+            Whether to use Dask-ML's pipeline optimiziations. This avoid re-fitting
+            the same estimator on the same split of data multiple times. It
+            will also provide more detailed diagnostics when using Dask's
+            distributed scheduler.
+
+            See `<avoid repeated work <https://dask-ml.readthedocs.io/en/latest/hyper-parameter-search.html#avoid-repeated-work>`_
+            for more.
 
         Returns
         -------
@@ -1181,7 +1189,6 @@ class TPOTBase(BaseEstimator):
 
         """
 
-        self._individuals = individuals
         operator_counts, eval_individuals_str, sklearn_pipeline_list, stats_dicts = self._preprocess_individuals(individuals)
 
         # Make the partial function that will be called below
@@ -1199,10 +1206,10 @@ class TPOTBase(BaseEstimator):
 
         result_score_list = []
         # Don't use parallelization if n_jobs==1
-        if self.n_jobs == 1:
+        if self.n_jobs == 1 and not self.use_dask:
             for sklearn_pipeline in sklearn_pipeline_list:
                 self._stop_by_max_time_mins()
-                val = partial_wrapped_cross_val_score(sklearn_pipeline=sklearn_pipeline, use_dask=self.use_dask)
+                val = partial_wrapped_cross_val_score(sklearn_pipeline=sklearn_pipeline)
                 result_score_list = self._update_val(val, result_score_list)
         else:
             # chunk size for pbar update
@@ -1235,12 +1242,6 @@ class TPOTBase(BaseEstimator):
                     # update pbar
                     for val in tmp_result_scores:
                         result_score_list = self._update_val(val, result_score_list)
-
-
-        self._result_score_list = result_score_list
-        self._eval_individuals_str = eval_individuals_str
-        self._operator_counts = operator_counts
-        self._stats_dicts = stats_dicts
 
         self._update_evaluated_individuals_(result_score_list, eval_individuals_str, operator_counts, stats_dicts)
 
